@@ -1,0 +1,26 @@
+{
+  "total_examples": 4830,
+  "train_size": 3381,
+  "val_size": 724,
+  "test_size": 725,
+  "intent_counts_train": {
+    "SET_REMINDER": 1033,
+    "CREATE_EVENT": 1385,
+    "QUERY_FREE_TIME": 715,
+    "CANCEL": 248
+  },
+  "intent_counts_val": {
+    "CREATE_EVENT": 290,
+    "SET_REMINDER": 221,
+    "CANCEL": 52,
+    "QUERY_FREE_TIME": 161
+  },
+  "intent_counts_test": {
+    "CREATE_EVENT": 320,
+    "QUERY_FREE_TIME": 134,
+    "SET_REMINDER": 211,
+    "CANCEL": 60
+  },
+  "unique_templates_total": 32,
+  "templates_shared_between_train_and_test": 32
+}
