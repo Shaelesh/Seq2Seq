@@ -33,10 +33,6 @@ def make_target(example):
     else:
         return "NA"
 
-
-# ---------------------------------------------------------------------
-# Extract only the date/time-relevant span from the sentence
-# ---------------------------------------------------------------------
 DATE_TIME_TAGS = {"B-DATE", "I-DATE", "B-TIME", "I-TIME"}
 
 def extract_relevant_span(example):
@@ -49,14 +45,12 @@ def extract_relevant_span(example):
     ]
 
     if not relevant_idx:
-        # No date/time tags at all -> fall back to full sentence
+
         return tokens
 
     start = min(relevant_idx)
     end = max(relevant_idx)
 
-    # Keep everything between first and last relevant tag
-    # (this naturally keeps untagged in-between words, e.g. "at")
     return tokens[start:end + 1]
 
 
@@ -283,10 +277,6 @@ test_loader = DataLoader(
     collate_fn=collate_fn
 )
 
-
-# ---------------------------------------------------------------------
-# Bidirectional encoder
-# ---------------------------------------------------------------------
 class Encoder(nn.Module):
 
     def __init__(
@@ -313,12 +303,12 @@ class Encoder(nn.Module):
             hidden_size=hidden_dim,
             num_layers=num_layers,
             batch_first=True,
-            bidirectional=True,
+            bidirectional=False,
             dropout=dropout if num_layers > 1 else 0
         )
 
-        self.fc_hidden = nn.Linear(hidden_dim * 2, hidden_dim)
-        self.fc_cell = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.fc_hidden = nn.Linear(hidden_dim, hidden_dim)
+        self.fc_cell = nn.Linear(hidden_dim, hidden_dim)
 
     def forward(self, input_ids, input_lengths):
 
@@ -333,18 +323,11 @@ class Encoder(nn.Module):
 
         packed_output, (hidden, cell) = self.lstm(packed)
 
-        batch_size = hidden.size(1)
-
-        hidden = hidden.view(self.num_layers, 2, batch_size, self.hidden_dim)
-        cell = cell.view(self.num_layers, 2, batch_size, self.hidden_dim)
-
-        hidden = torch.cat([hidden[:, 0], hidden[:, 1]], dim=-1)
-        cell = torch.cat([cell[:, 0], cell[:, 1]], dim=-1)
-
         hidden = torch.tanh(self.fc_hidden(hidden))
         cell = torch.tanh(self.fc_cell(cell))
 
         return hidden, cell
+    
 
 INPUT_VOCAB_SIZE = len(input_vocab)
 
