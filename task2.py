@@ -216,16 +216,10 @@ def train_one_epoch(model, loader):
 
         logits = model(tokens)
 
-        # logits:
-        # [batch, sequence_length, num_tags]
-
         logits = logits.view(
             -1,
             logits.size(-1)
         )
-
-        # tags:
-        # [batch, sequence_length]
 
         tags = tags.view(-1)
 
