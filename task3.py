@@ -8,10 +8,6 @@ from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence
 import random
 
 
-
-
-
-
 with open("train.json", "r") as f:
     train_data = json.load(f)
 
@@ -37,13 +33,40 @@ def make_target(example):
     else:
         return "NA"
 
+
+# ---------------------------------------------------------------------
+# Extract only the date/time-relevant span from the sentence
+# ---------------------------------------------------------------------
+DATE_TIME_TAGS = {"B-DATE", "I-DATE", "B-TIME", "I-TIME"}
+
+def extract_relevant_span(example):
+    tokens = example["tokens"]
+    tags = example["tags"]
+
+    relevant_idx = [
+        i for i, t in enumerate(tags)
+        if t in DATE_TIME_TAGS
+    ]
+
+    if not relevant_idx:
+        # No date/time tags at all -> fall back to full sentence
+        return tokens
+
+    start = min(relevant_idx)
+    end = max(relevant_idx)
+
+    # Keep everything between first and last relevant tag
+    # (this naturally keeps untagged in-between words, e.g. "at")
+    return tokens[start:end + 1]
+
+
 from collections import Counter
 
 word_counter = Counter()
 
 for example in train_data:
-    word_counter.update(example["tokens"])
-    
+    word_counter.update(extract_relevant_span(example))
+
 input_vocab = {
     "<PAD>": 0,
     "<UNK>": 1
@@ -51,19 +74,69 @@ input_vocab = {
 
 for word in word_counter:
     input_vocab[word] = len(input_vocab)
-    
+
 idx_to_word = {
     idx: word
     for word, idx in input_vocab.items()
 }
 
-char_set = set()
+
+# ---------------------------------------------------------------------
+# SLOT-BASED TARGET TOKENIZATION
+# Every target is exactly 5 tokens: [YEAR, MONTH, DAY, HOUR, MINUTE]
+# Missing date -> YEAR/MONTH/DAY = "NA","NA","NA"
+# Missing time -> HOUR/MINUTE = "NA","NA"
+# Missing both -> all five slots = "NA"
+# ---------------------------------------------------------------------
+def tokenize_target(example):
+
+    date = example["date_iso"]   # e.g. "2026-06-15" or None
+    time = example["time_hm"]    # e.g. "20:00" or None
+
+    if date is not None:
+        year, month, day = date.split("-")
+    else:
+        year, month, day = "NA", "NA", "NA"
+
+    if time is not None:
+        hour, minute = time.split(":")
+    else:
+        hour, minute = "NA", "NA"
+
+    return [year, month, day, hour, minute]
+
+
+def reconstruct_from_slots(slots):
+    """
+    Inverse of tokenize_target: turns [year,month,day,hour,minute]
+    back into the same string format make_target() produces, so we
+    can directly compare predictions against targets.
+    """
+    year, month, day, hour, minute = slots
+
+    date_part = None
+    if year != "NA":
+        date_part = f"{year}-{month}-{day}"
+
+    time_part = None
+    if hour != "NA":
+        time_part = f"{hour}:{minute}"
+
+    if date_part is not None and time_part is not None:
+        return f"{date_part} {time_part}"
+    elif date_part is not None:
+        return date_part
+    elif time_part is not None:
+        return time_part
+    else:
+        return "NA"
+
+
+slot_value_set = set()
 
 for example in train_data:
-    target = make_target(example)
-
-    for ch in target:
-        char_set.add(ch)
+    for tok in tokenize_target(example):
+        slot_value_set.add(tok)
 
 output_vocab = {
     "<PAD>": 0,
@@ -71,12 +144,12 @@ output_vocab = {
     "<EOS>": 2
 }
 
-for ch in sorted(char_set):
-    output_vocab[ch] = len(output_vocab)
+for tok in sorted(slot_value_set):
+    output_vocab[tok] = len(output_vocab)
 
 idx_to_char = {
-    idx: ch
-    for ch, idx in output_vocab.items()
+    idx: tok
+    for tok, idx in output_vocab.items()
 }
 
 def encode_input(tokens):
@@ -85,19 +158,28 @@ def encode_input(tokens):
         for word in tokens
     ]
 
-def encode_target(target):
+def encode_target(example):
+    """
+    Now takes the full example (not a string), since slots come
+    straight from date_iso / time_hm.
+    """
     encoded = [output_vocab["<SOS>"]]
 
-    for ch in target:
-        encoded.append(output_vocab[ch])
+    for tok in tokenize_target(example):
+        # Unseen slot values (e.g. a year not in train) fall back to NA
+        # rather than crashing -- shouldn't normally happen but is safe.
+        encoded.append(output_vocab.get(tok, output_vocab["NA"]))
 
     encoded.append(output_vocab["<EOS>"])
 
     return encoded
 
 def decode_target(indices):
-
-    chars = []
+    """
+    Strips SOS/PAD/EOS, then reconstructs the date/time string from
+    the 5 slot tokens.
+    """
+    toks = []
 
     for idx in indices:
 
@@ -110,9 +192,13 @@ def decode_target(indices):
         ]:
             continue
 
-        chars.append(idx_to_char[idx])
+        toks.append(idx_to_char[idx])
 
-    return "".join(chars)
+    # Pad defensively in case generation stopped early / malformed
+    while len(toks) < 5:
+        toks.append("NA")
+
+    return reconstruct_from_slots(toks[:5])
 
 class CalendarDataset(Dataset):
 
@@ -126,16 +212,16 @@ class CalendarDataset(Dataset):
 
         example = self.data[idx]
 
-        input_ids = encode_input(example["tokens"])
+        span_tokens = extract_relevant_span(example)
+        input_ids = encode_input(span_tokens)
 
-        target = make_target(example)
-        target_ids = encode_target(target)
+        target_ids = encode_target(example)
 
         return (
             torch.tensor(input_ids, dtype=torch.long),
             torch.tensor(target_ids, dtype=torch.long)
         )
-        
+
 train_dataset = CalendarDataset(train_data)
 val_dataset = CalendarDataset(val_data)
 test_dataset = CalendarDataset(test_data)
@@ -198,6 +284,9 @@ test_loader = DataLoader(
 )
 
 
+# ---------------------------------------------------------------------
+# Bidirectional encoder
+# ---------------------------------------------------------------------
 class Encoder(nn.Module):
 
     def __init__(
@@ -210,6 +299,9 @@ class Encoder(nn.Module):
     ):
         super().__init__()
 
+        self.hidden_dim = hidden_dim
+        self.num_layers = num_layers
+
         self.embedding = nn.Embedding(
             input_vocab_size,
             embedding_dim,
@@ -221,9 +313,12 @@ class Encoder(nn.Module):
             hidden_size=hidden_dim,
             num_layers=num_layers,
             batch_first=True,
-            bidirectional=False,
+            bidirectional=True,
             dropout=dropout if num_layers > 1 else 0
         )
+
+        self.fc_hidden = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.fc_cell = nn.Linear(hidden_dim * 2, hidden_dim)
 
     def forward(self, input_ids, input_lengths):
 
@@ -238,8 +333,19 @@ class Encoder(nn.Module):
 
         packed_output, (hidden, cell) = self.lstm(packed)
 
+        batch_size = hidden.size(1)
+
+        hidden = hidden.view(self.num_layers, 2, batch_size, self.hidden_dim)
+        cell = cell.view(self.num_layers, 2, batch_size, self.hidden_dim)
+
+        hidden = torch.cat([hidden[:, 0], hidden[:, 1]], dim=-1)
+        cell = torch.cat([cell[:, 0], cell[:, 1]], dim=-1)
+
+        hidden = torch.tanh(self.fc_hidden(hidden))
+        cell = torch.tanh(self.fc_cell(cell))
+
         return hidden, cell
-    
+
 INPUT_VOCAB_SIZE = len(input_vocab)
 
 EMBEDDING_DIM = 128
@@ -337,7 +443,6 @@ class Seq2Seq(nn.Module):
 
         output_vocab_size = self.decoder.fc_out.out_features
 
-        # Store predictions for every timestep
         outputs = torch.zeros(
             batch_size,
             target_length,
@@ -345,16 +450,13 @@ class Seq2Seq(nn.Module):
             device=self.device
         )
 
-        # Encode input
         hidden, cell = self.encoder(
             input_ids,
             input_lengths
         )
 
-        # First decoder input = <SOS>
         decoder_input = target_ids[:, 0]
 
-        # Generate target sequence
         for t in range(1, target_length):
 
             output, hidden, cell = self.decoder(
@@ -365,13 +467,10 @@ class Seq2Seq(nn.Module):
 
             outputs[:, t] = output
 
-            # Choose whether to use teacher forcing
             teacher_force = random.random() < teacher_forcing_ratio
 
-            # Model prediction
             top1 = output.argmax(1)
 
-            # Next decoder input
             decoder_input = (
                 target_ids[:, t]
                 if teacher_force
@@ -379,7 +478,7 @@ class Seq2Seq(nn.Module):
             )
 
         return outputs
-    
+
 DEVICE = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
 )
@@ -475,7 +574,6 @@ def evaluate(
             input_lengths = input_lengths.to(device)
             target_ids = target_ids.to(device)
 
-            # No teacher forcing during validation
             outputs = model(
                 input_ids,
                 input_lengths,
@@ -500,18 +598,25 @@ def evaluate(
 
     return epoch_loss / len(loader)
 
-def predict(model, tokens, input_vocab, output_vocab, idx_to_char, device, max_length=30):
+def predict(model, example, input_vocab, output_vocab, idx_to_char, device, max_length=5):
+    """
+    Takes the full example dict (needs tags for the span, same as
+    training). Generates exactly up to 5 slot tokens and reconstructs
+    the date/time string.
+    """
 
     model.eval()
 
+    span_tokens = extract_relevant_span(example)
+
     input_ids = torch.tensor(
-        encode_input(tokens),
+        encode_input(span_tokens),
         dtype=torch.long,
         device=device
     ).unsqueeze(0)
 
     input_lengths = torch.tensor(
-        [len(tokens)],
+        [len(span_tokens)],
         dtype=torch.long,
         device=device
     )
@@ -539,7 +644,6 @@ def predict(model, tokens, input_vocab, output_vocab, idx_to_char, device, max_l
                 cell
             )
 
-            # Pick highest probability character
             prediction = output.argmax(1)
 
             predicted_id = prediction.item()
@@ -557,9 +661,12 @@ def predict(model, tokens, input_vocab, output_vocab, idx_to_char, device, max_l
 
             decoder_input = prediction
 
-    return "".join(generated)
+    while len(generated) < 5:
+        generated.append("NA")
 
-N_EPOCHS = 10
+    return reconstruct_from_slots(generated[:5])
+
+N_EPOCHS = 15
 
 for epoch in range(N_EPOCHS):
 
@@ -584,7 +691,7 @@ for epoch in range(N_EPOCHS):
         f"Train Loss: {train_loss:.4f} | "
         f"Val Loss: {val_loss:.4f}"
     )
-    
+
 print("\n===== FULL TEST EVALUATION =====")
 
 total = 0
@@ -627,7 +734,7 @@ for example in test_data:
 
     prediction = predict(
         model,
-        example["tokens"],
+        example,
         input_vocab,
         output_vocab,
         idx_to_char,
@@ -669,4 +776,3 @@ for target_type in type_total:
         f"{correct_type}/{total_type} "
         f"({accuracy:.4f})"
     )
-    
